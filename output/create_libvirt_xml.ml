@@ -250,10 +250,20 @@ let create_libvirt_xml ?pool source inspect
         ]
 
     | BusSlotRemovable { s_removable_type = CDROM } ->
+        (* For SCSI CD-ROMs, use srX device names (sr0, sr1, etc.)
+         * to avoid conflicts with sdX disk names. *)
+        let dev =
+          if bus_name = "scsi" then
+            if i = 0 then "sr0"
+            else if i = 1 then "sr1"
+            else sprintf "sr%d" i
+          else
+            drive_prefix ^ drive_name i
+        in
         e "disk" [ "device", "cdrom"; "type", "file" ] [
           e "driver" [ "name", "qemu"; "type", "raw" ] [];
           e "target" [
-            "dev", drive_prefix ^ drive_name i;
+            "dev", dev;
             "bus", bus_name
           ] []
         ]
