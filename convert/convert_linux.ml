@@ -31,6 +31,8 @@ open Utils
 open Types
 open Linux_kernels
 
+open Hashtbl
+
 module G = Guestfs
 
 (* The conversion function. *)
@@ -1161,6 +1163,59 @@ fi
       flush stderr
     );
 
+    let rex_resume = PCRE.compile "^resume=(/dev/[-a-z\\d/_]+)(.*)$"
+    and rex_device_cciss = PCRE.compile "^/dev/(cciss/c\\d+d\\d+)(?:p(\\d+))?$"
+    and rex_device_nvme = PCRE.compile "^/dev/(nvme\\d+n1)(?:p(\\d+))?$"
+    and rex_device = PCRE.compile "^/dev/([a-z]+)(\\d*)?$" in
+
+    let replace_if_device path value =
+      debug "remap_block_devices: *** ENTER replace_if_device for path=%s value=%s ***" path value;
+      let replace device =
+        debug "remap_block_devices: Attempting to replace device '%s'" device;
+        try 
+          let new_dev = List.assoc device map in
+          debug "remap_block_devices: Replaced '%s' with '%s'" device new_dev;
+          new_dev
+        with Not_found ->
+          debug "remap_block_devices: No mapping found for device '%s'" device;
+          if not (String.starts_with "md" device) &&
+             not (String.starts_with "fd" device) &&
+             not (String.starts_with "sr" device) &&
+             not (String.starts_with "scd" device) &&
+             device <> "cdrom" then
+            warning (f_"%s references unknown device \"%s\".  You may have to \
+                        fix this entry manually after conversion.")
+              path device;
+          device
+      in
+
+      let result =
+        if PCRE.matches rex_device_cciss value then (
+          let device = PCRE.sub 1
+          and part = try PCRE.sub 2 with Not_found -> "" in
+          debug "remap_block_devices: Matched cciss pattern: device=%s part=%s" device part;
+          "/dev/" ^ replace device ^ part
+        )
+        else if PCRE.matches rex_device_nvme value then (
+          let device = PCRE.sub 1
+          and part = try PCRE.sub 2 with Not_found -> "" in
+          debug "remap_block_devices: Matched nvme pattern: device=%s part=%s" device part;
+          "/dev/" ^ replace device ^ part
+        )
+        else if PCRE.matches rex_device value then (
+          let device = PCRE.sub 1
+          and part = try PCRE.sub 2 with Not_found -> "" in
+          debug "remap_block_devices: Matched general device pattern: device=%s part=%s" device part;
+          "/dev/" ^ replace device ^ part
+        )
+        else ( (* doesn't look like a known device name *)
+          debug "remap_block_devices: Value '%s' does not match any device pattern" value;
+          value
+        ) in
+      debug "remap_block_devices: *** EXIT replace_if_device: result=%s ***" result;
+      result
+    in
+
     (* Possible Augeas paths to search for device names. *)
     let paths = [
       (* /etc/fstab *)
@@ -1173,86 +1228,133 @@ fi
     let paths =
       List.flatten (List.map Array.to_list (List.map g#aug_match paths)) in
 
+    let blkid_cache = Hashtbl.create 13 in
+
+    let is_persistent specifier =
+      String.starts_with specifier "UUID=" ||
+      String.starts_with specifier "LABEL=" ||
+      String.starts_with specifier "PARTUUID=" in
+
+    let get_persistent path specifier blkid_cache =
+      debug "remap_block_devices: *** ENTER get_persistent for path=%s specifier=%s ***" path specifier;
+      if is_persistent specifier then (
+        debug "remap_block_devices: %s: specifier '%s' is already persistent, no change" path specifier;
+        specifier
+      ) else if not (String.starts_with specifier "/dev/") then (
+        debug "remap_block_devices: %s: specifier '%s' does not start with /dev/, no change" path specifier;
+        specifier
+      ) else (
+        let dev = specifier in
+        debug "remap_block_devices: %s: processing device specifier '%s'" path dev;
+        let canon =
+          try
+            let c = g#realpath dev in
+            debug "remap_block_devices: %s: realpath resolved '%s' to '%s'" path dev c;
+            c
+          with G.Error msg ->
+            warning (f_"%s: could not resolve symlink for device '%s': %s (falling back)") path dev msg;
+            dev in
+        if not (g#exists canon) then (
+          warning (f_"%s: canonical device '%s' does not exist in the guest (falling back to remap)") path canon;
+          let fallback = replace_if_device path dev in
+          debug "remap_block_devices: %s: Fallback to replace_if_device resulted in '%s'" path fallback;
+          fallback
+        ) else (
+          let props_ht =
+            try 
+              let ht = Hashtbl.find blkid_cache canon in
+              debug "remap_block_devices: %s: Found cached blkid results for '%s'" path canon;
+              ht
+            with Not_found ->
+              debug "remap_block_devices: %s: running blkid on '%s'" path canon;
+              let props = g#blkid canon in
+              let ht = Hashtbl.create (List.length props) in
+              List.iter (fun (k, v) ->
+                debug "remap_block_devices: %s: blkid '%s': %s=%s" path canon k v;
+                Hashtbl.add ht k v
+              ) props;
+              Hashtbl.add blkid_cache canon ht;
+              debug "remap_block_devices: %s: Cached new blkid results for '%s'" path canon;
+              ht in
+          if Hashtbl.mem props_ht "UUID" then (
+            let uuid = Hashtbl.find props_ht "UUID" in
+            debug "remap_block_devices: %s: replacing '%s' with UUID=%s" path specifier uuid;
+            "UUID=" ^ uuid
+          ) else if Hashtbl.mem props_ht "PARTUUID" then (
+            let partuuid = Hashtbl.find props_ht "PARTUUID" in
+            debug "remap_block_devices: %s: replacing '%s' with PARTUUID=%s" path specifier partuuid;
+            "PARTUUID=" ^ partuuid
+          ) else if Hashtbl.mem props_ht "LABEL" then (
+            let label = Hashtbl.find props_ht "LABEL" in
+            debug "remap_block_devices: %s: replacing '%s' with LABEL=%s" path specifier label;
+            "LABEL=" ^ label
+          ) else (
+            warning (f_"%s: no UUID, PARTUUID, or LABEL found for device '%s' (%s), falling back to device remapping") path dev canon;
+            let fallback = replace_if_device path dev in
+            debug "remap_block_devices: %s: Fallback to replace_if_device resulted in '%s'" path fallback;
+            fallback
+          )
+        )
+      ) in
+
     (* Map device names for each entry. *)
-    let rex_resume = PCRE.compile "^resume=(/dev/[-a-z\\d/_]+)(.*)$"
-    and rex_device_cciss = PCRE.compile "^/dev/(cciss/c\\d+d\\d+)(?:p(\\d+))?$"
-    and rex_device_nvme = PCRE.compile "^/dev/(nvme\\d+n1)(?:p(\\d+))?$"
-    and rex_device = PCRE.compile "^/dev/([a-z]+)(\\d*)?$" in
-
-    let rec replace_if_device path value =
-      let replace device =
-        try List.assoc device map
-        with Not_found ->
-          if not (String.starts_with "md" device) &&
-             not (String.starts_with "fd" device) &&
-             not (String.starts_with "sr" device) &&
-             not (String.starts_with "scd" device) &&
-             device <> "cdrom" then
-            warning (f_"%s references unknown device \"%s\".  You may have to \
-                        fix this entry manually after conversion.")
-              path device;
-          device
-      in
-
-      if PCRE.matches rex_device_cciss value then (
-        let device = PCRE.sub 1
-        and part = try PCRE.sub 2 with Not_found -> "" in
-        "/dev/" ^ replace device ^ part
-      )
-      else if PCRE.matches rex_device_nvme value then (
-        let device = PCRE.sub 1
-        and part = try PCRE.sub 2 with Not_found -> "" in
-        "/dev/" ^ replace device ^ part
-      )
-      else if PCRE.matches rex_device value then (
-        let device = PCRE.sub 1
-        and part = try PCRE.sub 2 with Not_found -> "" in
-        "/dev/" ^ replace device ^ part
-      )
-      else (* doesn't look like a known device name *)
-        value
-    in
 
     let changed = ref false in
     List.iter (
       fun path ->
-        let value = g#aug_get path in
-        let new_value =
+        debug "remap_block_devices: *** PROCESSING PATH %s ***" path;
+        let specifier = g#aug_get path in
+        debug "remap_block_devices: processing augeas path %s with specifier '%s'" path specifier;
+        let new_specifier =
           if String.find path "GRUB_CMDLINE" >= 0 then (
-            (* Handle grub2 resume=<dev> specially. *)
-            let rec loop str =
-              let index = String.find str "resume=" in
-              if index >= 0 then (
-                let part = String.sub str index (String.length str - index) in
-                if PCRE.matches rex_resume part then (
-                  let start = String.sub str 0 (index + 7 (* "resume=" *))
-                  and device = PCRE.sub 1
-                  and end_ = PCRE.sub 2 in
-                  let device = replace_if_device path device in
-                  start ^ device ^ loop end_
+            debug "remap_block_devices: %s: Processing GRUB_CMDLINE_LINUX" path;
+            let rec loop str acc =
+              let i = String.find str "resume=" in
+              if i < 0 then (
+                debug "remap_block_devices: %s: no more 'resume=' found, final string: %s" path (acc ^ str);
+                acc ^ str
+              ) else (
+                let rest = String.sub str i (String.length str - i) in
+                if PCRE.matches rex_resume rest then (
+                  let prefix = acc ^ String.sub str 0 (i + 7) in (* includes resume= *)
+                  let device = PCRE.sub 1 in
+                  let suffix = PCRE.sub 2 in
+                  debug "remap_block_devices: %s: found resume= with device '%s'" path device;
+                  let new_device = get_persistent path device blkid_cache in
+                  debug "remap_block_devices: %s: new resume device '%s'" path new_device;
+                  loop suffix (prefix ^ new_device)
+                ) else (
+                  debug "remap_block_devices: %s: 'resume=' found but does not match expected format, skipping" path;
+                  acc ^ str
                 )
-                else str
               )
-              else str
             in
-            loop value
-          )
-          else
-            replace_if_device path value in
-
-        if value <> new_value then (
-          g#aug_set path new_value;
+            loop specifier ""
+          ) else (
+            let new_spec = get_persistent path specifier blkid_cache in
+            debug "remap_block_devices: %s: get_persistent returned '%s'" path new_spec;
+            new_spec
+          ) in
+        if specifier <> new_specifier then (
+          debug "remap_block_devices: %s: updated specifier from '%s' to '%s'" path specifier new_specifier;
+          g#aug_set path new_specifier;
           changed := true
-        )
+        ) else (
+          debug "remap_block_devices: %s: specifier '%s' unchanged" path specifier
+        );
+        debug "remap_block_devices: *** FINISHED PATH %s ***" path
     ) paths;
 
     if !changed then (
+      debug "remap_block_devices: Changes detected, saving augeas";
       g#aug_save ();
 
       (* Make sure the bootloader is up-to-date. *)
       bootloader#update ();
 
       Linux.augeas_reload g
+    ) else (
+      debug "remap_block_devices: No changes detected"
     );
 
     (* Some linux uefi setups can't boot after conversion because of
